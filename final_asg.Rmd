@@ -1,0 +1,880 @@
+---
+title: "Assignment Template"
+date: "AT 2023"
+output: html_document
+---
+[Github link to html and rmd file](https://github.com/hua5tu/my472-uk-parliament-analysis)
+
+# Introduction:
+
+In the UK House of Commons, Members of Parliament (MPs) can question government ministers within their areas of responsibility, overseeing government actions and policies. This practice empowers MPs to scrutinize policies, gather information for their constituencies and the public, and ensure government accountability.
+
+This study investigates the characteristics and factors that differentiate MPs asking about economic issues from those focusing on health and welfare. By analyzing MPs' questioning patterns, the research aims to reveal the motivations behind MPs' emphasis on specific policy areas. Understanding these inclinations is crucial for grasping individual MPs' policy preferences and parliamentary dynamics.
+
+The study will examine how various factors and characteristics influence MPs' question tendencies by plotting the distribution of question types filtered by these factors. By analyzing these distribution plots, the study aims to identify which factors distinguish MPs asking about economic issues from those focusing on health and welfare.
+
+# Data
+The primary data source for this study is the [UK Parliament API](https://developer.parliament.uk/). Three categories of APIs—[Members](https://members-api.parliament.uk/index.html), [Oral Questions](https://oralquestionsandmotions-api.parliament.uk/swagger/ui/index), and [Written Questions](https://questions-statements-api.parliament.uk/index.html)—are utilized. The Oral and Written Question APIs provide data on question text, asking members' ID, and party, while the Member API offers information on MPs. The httr package in R is used to access these APIs by requesting URLs with different endpoints.
+
+In managing the data, the study concentrates on extracting information from 2023 to ensure a contemporary grasp of MPs' questioning patterns, potentially limiting a broader dataset overview. The author specifies API parameters for targeted data extraction. Questions are categorized based on the answering body, with distinct codes denoting economic or health and welfare issues. Monthly data extraction is consolidated into a final dataset comprising four columns ("question," "ID," "party," "question_type") and 3237 observations.
+
+Each factor under examination results in a final dataset with columns for MP ID, question type, and the specific factor (e.g., gender). All final datasets are saved in the database to avoid rerunning the code. Data transformation generates separate datasets for each factor, detailing the count of each question type for different factor values (e.g., male and female MPs). Similar structures are applied to other factors.
+
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, results='hide', message=FALSE, eval = FALSE)
+```
+
+```{r eval = TRUE}
+library("tidyverse")
+library("netstat")
+library(topicmodels)
+library(dplyr)
+library(tm)
+library(httr)
+library(tibble)
+library(DBI)
+library(ggplot2)
+library(maps)
+library(parlitools)
+library(jsonlite)
+library(gridExtra)
+```
+
+```{r eval=TRUE}
+# Create the database to store the extracted data
+db <- dbConnect(RSQLite::SQLite(), "database/ukparliament.sqlite")
+file.exists('database/ukparliament.sqlite')
+```
+
+
+```{r}
+# Base url for oral questions
+oral_questions_url <- "https://oralquestionsandmotions-api.parliament.uk/oralquestions/list"
+```
+
+```{r}
+# Function to extract data about oral questions, for specified list of ids, 
+# between specified time frame
+oral_questions_function <- function(answering_body_id, date1, date2) {
+  t_init <- tibble()
+  
+  query_params_answeringbodyid <- paste0("parameters.answeringBodyIds=",
+                                         answering_body_id, collapse = "&")
+  query_params_startdate <- paste0("parameters.answeringDateStart=", date1)
+  query_params_enddate <- paste0("parameters.answeringDateEnd=", date2)
+  query_params_take <- paste0("parameters.take=", 100)
+  
+  # Create the URL with specified answering body id and time frame
+  full_url <- paste0(oral_questions_url, "?", query_params_startdate, "&", query_params_enddate, "&", query_params_answeringbodyid, "&", query_params_take)
+  
+
+  # Get the return of the request
+  r <- GET(full_url)
+  
+  # Add a check whether rate limit was hit and retry until status code OK
+  while (r$status_code != 200){
+    message("Error occured. Retry after 10 seconds..")
+    Sys.sleep(10) # Wait 10 seconds
+    r <- GET(full_url)
+  }
+  
+  # Parse the return into R once no error
+  json <- content(r, "parsed")
+  data_list <- json$Response
+  if (length(json$Response) != 0) {
+    # Convert the retrieved data into a tibble
+    t_init <- tibble(
+    QuestionText = sapply(data_list, `[[`, "QuestionText"),
+    AnsweringBody = sapply(data_list, `[[`, "AnsweringBody"),
+    AnsweringBodyIds = sapply(data_list, `[[`, "AnsweringBodyId"),
+    AnsweringWhen = sapply(data_list, `[[`, "AnsweringWhen"),
+    AskingMember_MnisId = sapply(data_list, function(x) x$AskingMember$MnisId),
+    AskingMember_Name = sapply(data_list, function(x) x$AskingMember$Name),
+    AskingMember_Constituency = sapply(data_list, function(x) x$AskingMember$Constituency),
+    AskingMember_Status = sapply(data_list, function(x) x$AskingMember$Status),
+    AskingMember_Party = sapply(data_list, function(x) x$AskingMember$Party),
+    AskingMember_PartyId = sapply(data_list, function(x) x$AskingMember$PartyId))
+  }
+  # Return the tibble which contains oral question data, for specified answering 
+  # body, and specified time frame
+  return(t_init)
+}
+```
+
+
+```{r}
+# Create a function to retrieve oral question data for specified year with the
+# help of oral_questions_function() function 
+oral_questions_years_function <- function(year) {
+  
+  # Create a sequence of months to loop over and two empty tibble to store data
+  # for economic, and health and welfare questions
+  months <- seq(1, 12)
+  oral_question_eco <- tibble()
+  oral_question_health <- tibble()
+  
+  # loop over months
+  for (m in months) {
+    if (m != 12) {
+      # Message to track progress
+      message(m)
+      
+      # Retrieve oral questions about economic issues for each month
+      # bind data together
+      oral_question_eco <- rbind(oral_question_eco, 
+                                  oral_questions_function(c(14, 202, 214),
+                                  date1 = paste0(year, "-", m), 
+                                  date2 = paste0(year, "-", m+1)))
+      Sys.sleep(3)
+      
+      # Retrieve oral questions about health and welfare issues for each month
+      # bind data together      
+      oral_question_health <- rbind(oral_question_health, 
+                                    oral_questions_function(c(17, 29),
+                                    date1 = paste0(year, "-", m), 
+                                    date2 = paste0(year, "-", m+1)))
+    }else{
+      # Message to track progress
+      message(m)
+      
+      # If it is December, hard coding the data retrieving process
+      oral_question_eco <- rbind(oral_question_eco, 
+                                  oral_questions_function(c(14, 202, 214),
+                                  date1 = paste0(year, "-12-01"), 
+                                  date2 = paste0(year, "-12-31")))
+      Sys.sleep(3)
+      
+      
+      oral_question_health <- rbind(oral_question_health, 
+                                    oral_questions_function(c(17, 29),
+                                    date1 = paste0(year, "-12-01"), 
+                                    date2 = paste0(year, "-12-31")))
+    }
+        
+    
+    # Wait 3 seconds between requests 
+    Sys.sleep(3)
+    
+  }
+  # Bind together oral questions about economic and health and welfare issues
+  oral_question <- rbind(oral_question_health, oral_question_eco)
+  return(oral_question)
+}
+```
+
+```{r}
+# Retrieve oral question data in the year of 2023
+oral_questions_2023 <- oral_questions_years_function(2023)
+```
+
+
+
+```{r}
+# Mutate oral question data, add one column indicating the type of question
+oral_questions_2023 <- oral_questions_2023 %>% 
+  mutate(typeOfIssues = ifelse(AnsweringBodyIds %in% c(14, 202, 214), "Economic Issues", "Health and Welfare Issues")) 
+```
+
+```{r}
+# Base url for written questions
+written_question_url <- "https://questions-statements-api.parliament.uk/api/writtenquestions/questions"
+```
+
+```{r}
+# Function to extract data about written questions, for specified list of ids, 
+# between specified time frame
+written_questions_function <- function(answering_body_id, date1, date2) {
+  t_tmp <- tibble()
+  
+  query_params_answeringbodies <- paste0("answeringBodies=", answering_body_id, collapse = "&")
+  query_params_answeredWhenFrom <- paste0("answeredWhenFrom=", date1)
+  query_params_answeredWhenTo <- paste0("answeredWhenTo=", date2)
+  query_params_take <- paste0("take=", 100)
+  
+  # Create the URL with specified answering body id and time frame
+  full_url <- paste0(written_question_url, "?", query_params_answeredWhenFrom, "&", query_params_answeredWhenTo, "&", "expandMember=true&",query_params_answeringbodies, "&house=Commons&", query_params_take)
+  
+
+  # Get the return of the request
+  r <- GET(full_url)
+  
+  # Add a check whether rate limit was hit and retry until status code OK
+  while (r$status_code != 200){
+    message("Error occured. Retry after 10 seconds..")
+    Sys.sleep(10) # Wait 10 seconds
+    r <- GET(full_url)
+  }
+  
+  # Parse the return into R once no error
+  json <- content(r, "parsed")
+  data_list <- json$results
+  # Convert the retrieved data into a tibble
+  if (length(json$results) != 0) {
+    t_tmp <- tibble(
+    QuestionText = sapply(data_list, function(x) x$value$questionText),
+    AnsweringBody = sapply(data_list, function(x) x$value$answeringBodyName),
+    AnsweringBodyId = sapply(data_list, function(x) x$value$answeringBodyId),
+    AnsweringWhen = sapply(data_list, function(x) x$value$dateAnswered),
+    AskingMember_Id = sapply(data_list, function(x) x$value$askingMemberId),
+    AskingMember_Name = sapply(data_list, function(x) x$value$askingMember$name),
+    AskingMember_Party = sapply(data_list, function(x) x$value$askingMember$party),
+    AskingMember_MemberFrom = sapply(data_list, function(x) x$value$askingMember$memberFrom),
+    House = sapply(data_list, function(x) x$value$house)
+    )
+  }
+  
+  # Return the tibble which contains written question data, for specified answering 
+  # body, and specified time frame
+  return(t_tmp)
+}
+```
+
+```{r}
+# Create a function to retrieve written question data for specified year with the
+# help of written_questions_function() function 
+written_questions_years_function <- function(year) {
+  
+  # Create a sequence of months to loop over and two empty tibble to store data
+  # for economic, and health and welfare questions
+  months <- seq(1, 12)
+  written_question_eco <- tibble()
+  written_question_health <- tibble()
+  
+  # loop over months
+  for (m in months) {
+    
+    # Message to track progress
+    message(m)
+    if (m!=12){
+      # Retrieve written questions about economic issues for each month
+      # bind data together
+      written_question_eco <- rbind(written_question_eco, 
+                                  written_questions_function(c(14, 202, 214),
+                                  date1 = paste0(year, "-", m), 
+                                  date2 = paste0(year, "-", m + 1)))
+      Sys.sleep(6)
+      
+      # Retrieve written questions about health and welfare issues for each month
+      # bind data together      
+      written_question_health <- rbind(written_question_health, 
+                                    written_questions_function(c(17, 29),
+                                    date1 = paste0(year, "-", m), 
+                                    date2 = paste0(year, "-", m + 1)))
+  }else{
+      # If it is December, hard coding the data retrieving process
+      written_question_eco <- rbind(written_question_eco, 
+                                  written_questions_function(c(14, 202, 214),
+                                  date1 = paste0(year, "-", 12, "-", 1), 
+                                  date2 = paste0(year, "-", 12, "-", 31)))
+      Sys.sleep(6)
+      
+      
+      written_question_health <- rbind(written_question_health, 
+                                    written_questions_function(c(17, 29),
+                                    date1 = paste0(year, "-", 12, "-", 1), 
+                                    date2 = paste0(year, "-", 12, "-", 31)))
+  }
+        
+    
+    # Wait 3 seconds between requests 
+    Sys.sleep(3)
+    
+  }
+  # Bind together written questions about economic and health and welfare issues
+  written_question <- rbind(written_question_health, written_question_eco)
+  return(written_question)
+}
+```
+
+```{r}
+# Mutate written question data, add one column indicating the type of question
+written_questions_2023 <- written_questions_years_function(2023)
+written_questions_2023 <- written_questions_2023  %>% 
+  mutate(typeOfIssues = ifelse(AnsweringBodyId %in% c(14, 202, 214), "Economic Issues", "Health and Welfare Issues")) 
+```
+
+```{r}
+# Select and rename columns which might be helpful in later analysis section: 
+# question, ID, party, and question type
+written_2023 <- written_questions_2023 %>% 
+  select(QuestionText, AskingMember_Id, AskingMember_Party, typeOfIssues) %>% 
+  rename(question = QuestionText, ID = AskingMember_Id, party = AskingMember_Party, question_type = typeOfIssues)
+
+oral_2023  <- oral_questions_2023 %>% 
+  select(question = QuestionText, ID = AskingMember_MnisId, party = AskingMember_Party, question_type = typeOfIssues)
+
+# Write tables for oral and written questions into database
+# If the session is terminated unexpectedly, we can still read the table from database
+dbWriteTable(db, "written_question", written_2023, overwrite = TRUE)
+dbWriteTable(db, "oral_question", oral_2023, overwrite = TRUE)
+```
+
+```{r}
+# Bind oral and written questions together
+# Now we have question data in the year of 2023
+question_2023 <- bind_rows(written_2023, oral_2023) %>% 
+  mutate(question_type = ifelse(question_type == "Economic Issues", "Economic", "Health and Welfare"))
+
+# Write the tibble of question data in 2023 into the database
+dbWriteTable(db, "question_2023", question_2023, overwrite = TRUE)
+```
+# Analysis
+
+The study primarily investigated five factors—party, gender, registered interests, committee membership, and area of focus—on MPs' questioning tendencies. By comparing the original bar chart of question types with unfiltered data to filtered plots based on these factors, the research aimed to address its inquiry.
+
+#### 1. Total number of questions classified by question type
+
+Figure 1 was created to depict the distribution of questions by type. The figure indicates that, without any filtering, MPs ask a comparable number of questions about economic issues (1595) and health and welfare issues (1642).
+
+```{r eval = TRUE}
+# Read questions tibble from database
+question_2023 <- dbReadTable(db, "question_2023")
+
+# Create the tibble about the counts for each question type
+total_number <- question_2023 %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+```
+
+```{r fig1,eval=TRUE , fig.cap = "Figure 1: Bar chart of count of questions by type, without any factors filtered. MPs ask similar number of question on economic issues, and social and welfare issues."}
+# Create char chart for the original dataset
+p_total <- ggplot(total_number, aes(x = question_type, y = count, fill = question_type)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3)+
+  labs(title = "Bar chart of questions by type", x = "question Type", y = "Count") +
+  theme_minimal()
+
+p_total
+```
+
+***
+#### 2. Party Affiliation
+Figure 2 illustrates the alteration in question counts when filtered by party affiliation. MPs from the Conservative, Labour, Independent, and Liberal Democrat parties tend to ask more questions about social and welfare issues, while those from other parties prioritise economic issues. Comparatively, Labour MPs are more inclined than Conservative MPs to pose questions about social welfare issues. Therefore, party affiliation is a discriminating factor in question tendencies.
+
+### Bar charts of questions filtered by party
+
+```{r eval=TRUE, fig2, fig.cap= "Figure 2: Bar charts of question counts by question types, filtered by party affiliation."}
+# Get the distinct party names a a vector
+party_names <- question_2023 %>% 
+  select(party) %>% 
+  distinct() 
+
+# Create a list to store the histograms (or to say bar chart)
+histogram_list <- list()
+
+# Loop to create histograms 
+for (i in 1:12) {
+  # Generate data for the histogram
+  question_per_party <- question_2023 %>% 
+  filter(party == party_names$party[i]) %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+  
+  # Create the histogram
+  p <- ggplot(question_per_party, aes(x = question_type, y = count, fill = count)) +
+    geom_bar(stat = "identity") +
+    labs(title = party_names$party[i]) +
+    theme_minimal() +
+    guides(fill = FALSE) +  # Adjust legend settings
+    theme(plot.title = element_text(size = 6, face = "bold", hjust = 1),
+          axis.title.x = element_blank(), 
+          axis.title.y = element_blank(), 
+          axis.text.x = element_text(size = 6))
+  
+  # Add the histogram to the list
+  histogram_list[[i]] <- p
+}
+
+# Convert the list of histograms into a grid
+grid.arrange(grobs = histogram_list, ncol = 4)
+```
+***
+#### 3. Gender
+Figure 3 presents the impact of gender on MPs' question tendencies. Upon applying gender filters, the data reveals that female MPs tend to pose a higher number of questions about health and welfare issues, whereas male MPs are more inclined to ask about economic matters, as compared to the unfiltered bar charts. While these charts indicate prominent differences in questioning tendencies, further statistical tests are required to ascertain whether these observed patterns truly correlate with the respective factors.
+
+```{r}
+# Create a tibble with ID and MP's gender, where gender column is empty now
+mp_id <- question_2023 %>% 
+  select(ID) %>% 
+  distinct() %>% 
+  mutate(gender = NA)
+
+# Get the list of distinct MP IDs
+mp_id_vec <- mp_id$ID
+
+# Base URL to retrieve data of each members through API
+member_base_url <- "https://members-api.parliament.uk/api/Members/"
+
+# Loop to extract data of each members in the mp_id_vec
+for (id in mp_id_vec) {
+  # Message to track progress
+  message(id)
+  # Request the data for the member
+  r <- GET(paste0(member_base_url, id))
+  json <- content(r, "parsed")
+  
+  # Fill in the gender column of mp_id tibble with the extracted data
+  mp_id[mp_id$ID == id, "gender"] <- json$value$gender 
+  Sys.sleep(1)
+}
+
+```
+
+```{r}
+# Merge the question_2023 dataset (with question type column and ID column) with 
+# the mp_id dataset (with gender column and ID column) to get the final dataset for
+# analysis
+question_gender <- merge(x=question_2023,y=mp_id,by.x="ID",by.y = "ID",all.x= TRUE) %>% 
+  mutate(gender = ifelse(gender == "F", "Female", "Male"))
+
+# save the tibble in the database
+dbWriteTable(db, "question_gender_2023", question_gender, overwrite = TRUE)
+```
+### Bar charts of questions filtered by gender of MPs
+```{r eval=TRUE, fig3, fig.cap = "Figure 3: Bar charts of question counts by question types, filtered by gender of MPs."}
+# Read the tibble from database
+question_gender <- dbReadTable(db, "question_gender_2023") 
+
+# transform tibble to plot
+# question counts per question type, filtered by gender
+question_female <- question_gender %>% 
+filter(gender == "Female") %>% 
+group_by(question_type) %>% 
+summarise(count = n())
+
+question_male <- question_gender %>% 
+filter(gender == "Male") %>% 
+group_by(question_type) %>% 
+summarise(count = n())
+
+
+# Create the histogram for female
+p_female <- ggplot(question_female, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white")+
+  labs(title = "Female") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+# Create the histogram for male
+p_male <- ggplot(question_male, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white")+
+  labs(title = "Male") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+total_number <- question_2023 %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+
+# Create the histogram for all MPs
+p_total <- ggplot(total_number, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+  labs(title = "Overall") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+
+grid.arrange(p_female, p_male, p_total,ncol = 3)
+```
+***
+
+#### 4. Registered Interests
+Figure 4 demonstrates how MPs' interests influence their questioning tendencies. Generally, MPs with more registered interests are more inclined to ask questions about health and welfare issues. However, when MPs have precisely two registered interests, they are more likely to pose questions on health and welfare issues. In summary, the number of registered interests is a discriminating factor in MPs' questioning tendencies.
+
+```{r}
+# Create a tibble with ID and MP's registered interests, where registered interests
+# column is empty now
+mp_registered_interests <- question_2023 %>% 
+  select(ID) %>% 
+  distinct() %>% 
+  mutate(registered_interests = NA)
+
+# Loop to extract data of each members in the mp_id_vec
+for (id in mp_id_vec) {
+  # Message to track progress
+  message(id)
+  
+  # Request the data for the member
+  r <- GET(urls <- paste0("https://members-api.parliament.uk/api/Members/", id, "/RegisteredInterests"))
+  json <- content(r, "parsed")
+  
+  # Fill in the registered interests column of mp_registered_interests tibble 
+  # with the extracted data
+  mp_registered_interests[mp_registered_interests$ID == id, "registered_interests"] <- length(json$value)
+  
+  Sys.sleep(1)
+}
+
+```
+
+```{r}
+# Merge the question_2023 dataset (with question type column and ID column) with 
+# the mp_registered_interests dataset (with registered interests column and ID 
+# column) to get the final dataset for analysis
+question_registered_interests <- merge(x=question_2023,y=mp_registered_interests, by.x="ID",by.y = "ID",all.x= TRUE)
+
+# save the tibble in the database
+dbWriteTable(db, "question_registered_interests_2023", question_registered_interests, overwrite = TRUE)
+```
+### Bar charts of questions filtered by registered interests of MPs
+```{r eval=TRUE, fig4, fig.cap = "Figure 4: Bar charts of question counts by question types, filtered by number of registered interests of MPs."}
+# Read the tibble from database
+question_registered_interests <- dbReadTable(db, "question_registered_interests_2023")
+
+
+# Create a list to store the histograms
+histogram_list <- list()
+
+# Loop to create histograms 
+for (i in 1:8) {
+  
+  # Generate data for number of registered interests
+  question_per_interest <- question_registered_interests %>% 
+  filter(registered_interests == i) %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+  
+  # Create the histogram
+  p <- ggplot(question_per_interest, aes(x = question_type, y = count, fill = count)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white")+
+    labs(title = i) +
+    theme_minimal() +
+    guides(fill = FALSE) +  # Adjust legend settings
+    theme(plot.title = element_text(size = 10, face = "bold"),
+          axis.title.x = element_blank(), 
+          axis.title.y = element_blank(), 
+          axis.text.x = element_text(size = 6))
+  
+  # Add the histogram to the list
+  histogram_list[[i]] <- p
+}
+
+# Convert the list of histograms into a grid
+grid.arrange(grobs = histogram_list, ncol = 4)
+```
+***
+
+```{r}
+# Create a tibble with ID and MP's staff, where staff column is empty now
+mp_staff <- question_2023 %>% 
+  select(ID) %>% 
+  distinct() %>% 
+  mutate(staff = NA)
+
+# Loop to extract data of each members in the mp_id_vec
+for (id in mp_id_vec) {
+  message(id)
+  r <- GET(urls <- paste0("https://members-api.parliament.uk/api/Members/", id, "/Staff"))
+  json <- content(r, "parsed")
+  if (length(json$value) == 0) {
+    mp_staff[mp_staff$ID == id, "staff"] <- NA
+  }else{
+    message(paste0(id, "is not empty"))
+    mp_staff[mp_staff$ID == id, "staff"] <- length(json$value)
+  }
+  Sys.sleep(1)
+}
+# However, we data are retrieved for staff endpoint
+dbWriteTable(db, "mp_staff", mp_staff, overwrite = TRUE)
+
+```
+
+#### 5. Committee Membership
+Figure 5 reveals that MPs' committee memberships impact their question tendencies. Membership is determined via keyword searches: MPs in departments with specific keywords before 2023 are linked to economic or health and welfare committees. MPs in economic committees tend to ask more economic questions, while those in health and welfare committees pose more questions on those topics.
+
+```{r}
+# Create a tibble with ID and MP's economic and health and welfare issues committee, 
+# where committee columns are empty now
+mp_committe <- question_2023 %>% 
+  select(ID) %>% 
+  distinct() %>% 
+  mutate(committe_member_eco = NA, committe_member_health = NA)
+
+# Set the keywords for economic issues, as well as health and welfare issues
+economic_key_words <- c("economic", "economy", "economics", "trade", "treasury", "business", "finance", "financial", "interest", "inflation", "bank")
+health_key_words <- c("work", "pensions", "pension", "employment", "health", "welfare", "equalities", "education")
+
+# Loop to extract data of each members in the mp_id_vec
+for (id in mp_id_vec) {
+  # Message to track progress
+  message(id)
+  
+  # Request the data for the member
+  r <- GET(urls <- paste0("https://members-api.parliament.uk/api/Members/", id, "/Biography"))
+  json <- content(r, "parsed")
+  
+  # If the extracted data does not have committeeMemberships category, continue the loop
+  if (length(json$value$committeeMemberships) == 0){
+    next
+  }
+  
+  # committeeMemberships data is a list of lists
+  committe_data <- json$value$committeeMemberships
+  
+  # Create an empty tibble to store the data later
+  tibble_tmp <- tibble()
+  
+  # Loop over each committee memberships of the MP
+  for (i in 1:length(committe_data)){
+    tibble_tmp <- bind_rows(tibble_tmp, committe_data[[i]])
+  }
+  
+  tibble_tmp <- tibble_tmp %>% 
+    # Since the question data is in year of 2023, we only take into consideration
+    # committee memberships before start of 2023 
+    filter(as.Date(startDate) < as.Date("2023-01-01")) 
+  
+  # Examine whether the name of the committee contains the economic keywords
+  mp_committe[mp_committe$ID == id, "committe_member_eco"] <- any(grepl(paste(economic_key_words, collapse = "|"), tolower(tibble_tmp$name)))
+  # Examine whether the name of the committee contains the health keywords
+  mp_committe[mp_committe$ID == id, "committe_member_health"] <- any(grepl(paste(health_key_words, collapse = "|"), tolower(tibble_tmp$name)))
+  Sys.sleep(1)
+}
+```
+
+```{r}
+# Merge the question_2023 dataset (with question type column and ID column) with 
+# the mp_committe dataset (with economic committee column and health committee column) 
+# to get the final dataset for analysis
+question_committe <- merge(x=question_2023,y=mp_committe, by.x="ID",by.y = "ID",all.x= TRUE)
+
+# Save the tibble to the database
+dbWriteTable(db, "question_committe", question_committe, overwrite = TRUE)
+
+```
+
+### Bar charts of questions filtered by committee memberships of MPs
+```{r eval = TRUE, fig5, fig.cap = "Figure 5: Bar charts of question counts by question types, filtered by committee memberships of MPs."}
+# Read the tibble of committee from the database
+question_committe <- dbReadTable(db, "question_committe")
+
+# Create a list to store the histograms
+histogram_list <- list()
+
+# Generate data for the histogram
+# Count question numbers filtered by economic committee membership 
+question_per_eco <- question_committe %>% 
+  filter(committe_member_eco == TRUE) %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+  
+  # Create the histogram
+  p_eco <- ggplot(question_per_eco, aes(x = question_type, y = count, fill = count)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+    labs(title = "Economic") +
+    theme_minimal() +
+    guides(fill = FALSE) +  # Adjust legend settings
+    theme(plot.title = element_text(size = 10, face = "bold"),
+          axis.title.x = element_blank(), 
+          axis.title.y = element_blank(), 
+          axis.text.x = element_text(size = 6))
+  
+  # Add the histogram to the list
+  histogram_list[[1]] <- p_eco
+
+# Generate data for the histogram
+# Count question numbers filtered by health committee membership 
+question_per_health <- question_committe %>% 
+filter(committe_member_health == TRUE) %>% 
+group_by(question_type) %>% 
+summarise(count = n())
+
+# Create the histogram
+p_health <- ggplot(question_per_health, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+  labs(title = "Health and Welfare") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+# Add the histogram to the list
+histogram_list[[2]] <- p_health
+
+total_number <- question_2023 %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+
+p_total <- ggplot(total_number, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+  labs(title = "Overall") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+histogram_list[[3]] <- p_total
+
+# Convert the list of histograms into a grid
+grid.arrange(grobs = histogram_list, ncol = 3)
+```
+***
+#### 6. Area of Focus
+Figure 6 examines the influence of MPs' areas of focus, reflecting patterns similar to committee membership. Employing a similar method, keyword searches ascertain whether MPs' areas of focus encompass economic or health and welfare issues. The results indicate that MPs with political interests in economic issues tend to ask questions about economic matters, and conversely for health and welfare issues.
+
+```{r}
+# Create the list of keywords for economic, and health and welfare issues
+economic_key_words <- c("economic", "economy", "economics", "trade", "treasury", "business", "finance", "financial", "interest", "inflation", "bank")
+health_key_words <- c("work", "pensions", "pension", "employment", "health", "welfare", "equalities", "education")
+
+# Create a tibble with ID and MP's economic and health and welfare issues focus, 
+# where focus columns are empty now
+mp_focus <- question_2023 %>% 
+  select(ID) %>% 
+  distinct() %>% 
+  mutate(focus_eco = NA, focus_health = NA)
+
+# Loop over every MPs
+for (id in mp_id_vec) {
+  # Message to track progress
+  message(id)
+  
+  # Create URL for each MP
+  r <- GET(urls <- paste0("https://members-api.parliament.uk/api/Members/", id, "/Focus"))
+  json <- content(r, "parsed")
+  
+  # If the MP does not have area of focus, continue for loop
+  if (length(json$value) == 0){
+    next
+  }
+  
+  focus_data <- json$value
+  political_interests <- NA
+  # Loop over all categories of areas of focus
+  for (i in 1:length(focus_data)){
+    # We only fetch "Political Interests" category of areas of focus
+    if (focus_data[[i]]$category == "Political Interests"){
+      # Store the political interests string 
+    political_interests <- unlist(focus_data[[i]]$focus)
+      }
+  }
+  
+  # If the MP's political interests match economic keywords, enter TRUE
+  mp_focus[mp_focus$ID == id, "focus_eco"] <- any(grepl(paste(economic_key_words, collapse = "|"), tolower(political_interests)))
+  
+  # If the MP's political interests match health and welfare keywords, enter TRUE
+  mp_focus[mp_focus$ID == id, "focus_health"] <- any(grepl(paste(health_key_words, collapse = "|"), tolower(political_interests)))
+  Sys.sleep(1)
+}
+```
+
+```{r}
+# Fill in NA cell with FALSE 
+mp_focus <- mp_focus %>% 
+  mutate(focus_eco = ifelse(is.na(focus_eco), FALSE, focus_eco), 
+         focus_health = ifelse(is.na(focus_health), FALSE, focus_health))
+
+# Merge the question_2023 dataset (with question type column and ID column) with 
+# the mp_focus dataset (with economic focus column and health focus column) 
+# to get the final dataset for analysis
+question_focus <- merge(x=question_2023,y=mp_focus, by.x="ID",by.y = "ID",all.x= TRUE)
+
+# Save the tibble to the database
+dbWriteTable(db, "question_focus", question_focus, overwrite = TRUE)
+
+```
+### Bar charts of questions filtered by areas of focus of MPs
+```{r eval=TRUE, fig6, fig.cap = "Figure 6: Bar charts of question counts by question types, filtered by areas of focus of MPs."}
+# Read the table from the database
+question_focus <- dbReadTable(db, "question_focus")
+
+# Create a list to store the histograms
+histogram_list <- list()
+
+
+# Generate  data for the economic focus
+question_focus_eco <- question_focus %>% 
+  filter(focus_eco == TRUE) %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+  
+  # Create the histogram
+  p_focus_eco <- ggplot(question_focus_eco, aes(x = question_type, y = count, fill = count)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+    labs(title = "Economic") +
+    theme_minimal() +
+    guides(fill = FALSE) +  # Adjust legend settings
+    theme(plot.title = element_text(size = 10, face = "bold"),
+          axis.title.x = element_blank(), 
+          axis.title.y = element_blank(), 
+          axis.text.x = element_text(size = 6))
+  
+  # Add the histogram to the list
+  histogram_list[[1]] <- p_focus_eco
+
+# Generate data for the health and welfare focus 
+question_focus_health <- question_focus %>% 
+filter(focus_health == TRUE) %>% 
+group_by(question_type) %>% 
+summarise(count = n())
+
+# Create the histogram
+p_focus_health <- ggplot(question_focus_health, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+  labs(title = "Social and Welfare") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+# Add the histogram to the list
+histogram_list[[2]] <- p_focus_health
+
+total_number <- question_2023 %>% 
+  group_by(question_type) %>% 
+  summarise(count = n())
+
+p_total <- ggplot(total_number, aes(x = question_type, y = count, fill = count)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), vjust = -0.5, size = 3, position = position_stack(vjust = 0), color = "white") +
+  labs(title = "Overall") +
+  theme_minimal() +
+  guides(fill = FALSE) +  # Adjust legend settings
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        axis.title.x = element_blank(), 
+        axis.title.y = element_blank(), 
+        axis.text.x = element_text(size = 6))
+
+histogram_list[[3]] <- p_total
+
+# Convert the list of histograms into a grid
+grid.arrange(grobs = histogram_list, ncol = 3)
+```
+
+# Discussion
+This analysis only investigates the impact of the aforementioned five factors for two main reasons. Firstly, some factors are challenging to quantify, such as an MP's experience or contribution. Secondly, the UK Parliament API offers low-quality datasets for certain factors; for instance, most MPs lack staff data. However, future researchers are encouraged to consider these factors, along with the influence of constituencies.
+
+
+# Code Appendix
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
